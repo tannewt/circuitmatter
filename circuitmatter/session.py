@@ -1,5 +1,4 @@
 import enum
-import json
 import time
 
 from . import case
@@ -13,7 +12,6 @@ import cryptography
 from cryptography.hazmat.primitives.ciphers.aead import AESCCM
 import ecdsa
 import hashlib
-import pathlib
 import struct
 
 
@@ -168,7 +166,8 @@ class UnsecuredSessionContext:
         self.message_reception_state = None
         self.message_counter = message_counter
         self.node_ipaddress = node_ipaddress
-        self.exchanges = {}
+        self.responder_exchanges = {}
+        self.initiator_exchanges = {}
 
         self.local_node_id = 0
 
@@ -215,7 +214,9 @@ class SecureSessionContext:
         self.session_idle_interval = None
         self.session_active_interval = None
         self.session_active_threshold = None
-        self.exchanges = {}
+        self.initiator_exchanges = {}
+        self.responder_exchanges = {}
+        self.subscriptions = {}
 
         self.local_node_id = 0
 
@@ -223,8 +224,15 @@ class SecureSessionContext:
         self.socket = socket
         self.node_ipaddress = None
 
+        self._next_exchange_id = random_source.randbelow(0x10000)
+
     def __str__(self):
         return f"Secure Session #{self.local_session_id} with {self.peer_node_id:x}"
+
+    @property
+    def next_exchange_id(self):
+        self._next_exchange_id = (self._next_exchange_id + 1) & 0xFFFF
+        return self._next_exchange_id
 
     @property
     def peer_active(self):
@@ -265,6 +273,9 @@ class SecureSessionContext:
         message.destination_node_id = self.peer_node_id
         if message.message_counter is None:
             message.message_counter = next(self.local_message_counter)
+
+        print("sending")
+        print(message)
 
         buf = memoryview(bytearray(1280))
         nbytes = message.encode_into(buf, cipher)
@@ -346,14 +357,11 @@ class MessageCounter:
 
 class SessionManager:
     def __init__(self, random_source, socket, node_credentials):
-        persist_path = pathlib.Path("counters.json")
-        if persist_path.exists():
-            self.nonvolatile = json.loads(persist_path.read_text())
-        else:
-            self.nonvolatile = {}
-            self.nonvolatile["check_in_counter"] = None
-            self.nonvolatile["group_encrypted_data_message_counter"] = None
-            self.nonvolatile["group_encrypted_control_message_counter"] = None
+        # TODO: Save and restore counters
+        self.nonvolatile = {}
+        self.nonvolatile["check_in_counter"] = None
+        self.nonvolatile["group_encrypted_data_message_counter"] = None
+        self.nonvolatile["group_encrypted_control_message_counter"] = None
         self.unencrypted_message_counter = MessageCounter(random_source=random_source)
         self.group_encrypted_data_message_counter = MessageCounter(
             self.nonvolatile["group_encrypted_data_message_counter"],
@@ -397,6 +405,18 @@ class SessionManager:
                 )
             session_context = self.unsecured_session_context[message.source_node_id]
         return session_context
+
+    def send_packets(self):
+        for session in self.secure_session_contexts:
+            if session == "reserved":
+                continue
+            for exchange in session.responder_exchanges.values():
+                exchange.resend_pending()
+            for exchange in session.initiator_exchanges.values():
+                exchange.resend_pending()
+
+            for subscription in session.subscriptions.values():
+                subscription.send_reports()
 
     def mark_duplicate(self, message):
         """Implements 4.6.7"""
@@ -467,25 +487,37 @@ class SessionManager:
         ):
             # Drop illegal combination of flags.
             return None
-        if message.exchange_id not in session.exchanges:
-            # Section 4.10.5.2
-            initiator = message.exchange_flags & ExchangeFlags.I
-            if initiator and not message.duplicate:
-                session.exchanges[message.exchange_id] = Exchange(
-                    session, not initiator, message.exchange_id, [message.protocol_id]
-                )
-                # Drop because the message isn't from an initiator.
-            elif message.exchange_flags & ExchangeFlags.R:
-                # Send a bare acknowledgement back.
-                raise NotImplementedError("Send a bare acknowledgement back")
-                return None
-            else:
-                # Just drop it.
-                return None
+        initiator = message.exchange_flags & ExchangeFlags.I
 
-        exchange = session.exchanges[message.exchange_id]
+        if initiator:
+            if message.exchange_id not in session.responder_exchanges:
+                # Section 4.10.5.2
+                if initiator and not message.duplicate:
+                    session.responder_exchanges[message.exchange_id] = Exchange(
+                        session,
+                        [message.protocol_id],
+                        not initiator,
+                        message.exchange_id,
+                    )
+                    # Drop because the message isn't from an initiator.
+                elif message.exchange_flags & ExchangeFlags.R:
+                    # Send a bare acknowledgement back.
+                    raise NotImplementedError("Send a bare acknowledgement back")
+                    return None
+                else:
+                    # Just drop it.
+                    print("just drop")
+                    return None
+
+            exchange = session.responder_exchanges[message.exchange_id]
+        else:
+            print(message)
+            if message.exchange_id == 59044:
+                message.exchange_id = 59043
+            exchange = session.initiator_exchanges[message.exchange_id]
         if exchange.receive(message):
             # If we want to drop the message, then return None.
+            print("exchange drop")
             return None
 
         return exchange

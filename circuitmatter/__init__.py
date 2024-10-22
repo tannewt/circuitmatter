@@ -12,6 +12,7 @@ from . import nonvolatile
 from .message import Message
 from .protocol import InteractionModelOpcode, ProtocolId, SecureProtocolOpcode
 from . import session
+from .subscription import Subscription
 from .device_types.utility.root_node import RootNode
 
 __version__ = "0.2.3"
@@ -144,6 +145,7 @@ class CircuitMatter:
 
         for server in device.servers:
             device.descriptor.ServerList.append(server.CLUSTER_ID)
+            server.endpoint = self._next_endpoint
             self.add_cluster(self._next_endpoint, server)
         self.add_cluster(self._next_endpoint, device.descriptor)
 
@@ -166,6 +168,8 @@ class CircuitMatter:
                 break
 
             self.process_packet(addr, self.packet_buffer[:nbytes])
+        # Do any retransmits or subscriptions
+        self.manager.send_packets()
 
     def _build_attribute_error(self, path, status_code):
         report = interaction_model.AttributeReportIB()
@@ -178,9 +182,9 @@ class CircuitMatter:
         report.AttributeStatus = astatus
         return report
 
-    def get_report(self, context, cluster, path):
+    def get_report(self, context, cluster, path, subscription=None):
         reports = []
-        datas = cluster.get_attribute_data(context, path)
+        datas = cluster.get_attribute_data(context, path, subscription=subscription)
         for data in datas:
             report = interaction_model.AttributeReportIB()
             report.AttributeData = data
@@ -219,7 +223,7 @@ class CircuitMatter:
 
         return response
 
-    def read_attribute_path(self, context, path):
+    def read_attribute_path(self, context, path, subscription=None):
         attribute_reports = []
         if path.Endpoint is None:
             endpoints = self._endpoints
@@ -241,7 +245,11 @@ class CircuitMatter:
                 clusters = [self._endpoints[endpoint][path.Cluster]]
             for cluster in clusters:
                 temp_path.Cluster = cluster.CLUSTER_ID
-                attribute_reports.extend(self.get_report(context, cluster, temp_path))
+                attribute_reports.extend(
+                    self.get_report(
+                        context, cluster, temp_path, subscription=subscription
+                    )
+                )
         return attribute_reports
 
     def process_packet(self, address, data):
@@ -431,6 +439,7 @@ class CircuitMatter:
                 response = interaction_model.ReportDataMessage()
                 response.AttributeReports = attribute_reports
                 exchange.send(response)
+                exchange.close()
             elif protocol_opcode == InteractionModelOpcode.WRITE_REQUEST:
                 print("Received Write Request")
                 write_request = interaction_model.WriteRequestMessage.decode(
@@ -447,6 +456,7 @@ class CircuitMatter:
                 response = interaction_model.WriteResponseMessage()
                 response.WriteResponses = write_responses
                 exchange.send(response)
+                exchange.close()
 
             elif protocol_opcode == InteractionModelOpcode.INVOKE_REQUEST:
                 print("Received Invoke Request")
@@ -490,6 +500,7 @@ class CircuitMatter:
                 response.SuppressResponse = False
                 response.InvokeResponses = invoke_responses
                 exchange.send(response)
+                exchange.close()
             elif protocol_opcode == InteractionModelOpcode.INVOKE_RESPONSE:
                 print("Received Invoke Response")
             elif protocol_opcode == InteractionModelOpcode.SUBSCRIBE_REQUEST:
@@ -497,18 +508,25 @@ class CircuitMatter:
                 subscribe_request = interaction_model.SubscribeRequestMessage.decode(
                     message.application_payload
                 )
-                print(subscribe_request)
+                subscription = Subscription(
+                    exchange.exchange_id,
+                    secure_session_context,
+                    subscribe_request.MinIntervalFloor,
+                    subscribe_request.MaxIntervalCeiling,
+                )
                 attribute_reports = []
                 for path in subscribe_request.AttributeRequests:
                     attribute_reports.extend(
-                        self.read_attribute_path(secure_session_context, path)
+                        self.read_attribute_path(
+                            secure_session_context, path, subscription=subscription
+                        )
                     )
                 response = interaction_model.ReportDataMessage()
-                response.SubscriptionId = exchange.exchange_id
+                response.SubscriptionId = subscription.id
                 response.AttributeReports = attribute_reports
                 exchange.send(response)
                 final_response = interaction_model.SubscribeResponseMessage()
-                final_response.SubscriptionId = exchange.exchange_id
+                final_response.SubscriptionId = subscription.id
                 final_response.MaxInterval = subscribe_request.MaxIntervalCeiling
                 exchange.queue(final_response)
             elif protocol_opcode == InteractionModelOpcode.STATUS_RESPONSE:

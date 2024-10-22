@@ -25,11 +25,19 @@ MRP_STANDALONE_ACK_TIMEOUT_MS = 200
 
 
 class Exchange:
-    def __init__(self, session, initiator: bool, exchange_id: int, protocols):
+    def __init__(
+        self, session, protocols, initiator: bool = True, exchange_id: int = -1
+    ):
         self.initiator = initiator
-        self.exchange_id = exchange_id
+        self.exchange_id = session.next_exchange_id if exchange_id < 0 else exchange_id
+        print(f"\033[93mnew exchange {self.exchange_id}\033[0m")
         self.protocols = protocols
         self.session = session
+
+        if self.initiator:
+            self.session.initiator_exchanges[self.exchange_id] = self
+        else:
+            self.session.responder_exchanges[self.exchange_id] = self
 
         self.pending_acknowledgement = None
         """Message number that is waiting for an ack from us"""
@@ -40,6 +48,8 @@ class Exchange:
         self.pending_retransmission = None
         """Message that we've attempted to send but hasn't been acked"""
         self.pending_payloads = []
+
+        self._closing = False
 
     def send(
         self,
@@ -62,6 +72,8 @@ class Exchange:
         if reliable:
             message.exchange_flags |= ExchangeFlags.R
             self.pending_retransmission = message
+            # TODO: Adjust this correctly.
+            self.next_retransmission_time = time.monotonic() + 0.1
         message.source_node_id = self.session.local_node_id
         if protocol_id is None:
             protocol_id = application_payload.PROTOCOL_ID
@@ -82,6 +94,7 @@ class Exchange:
 
     def send_standalone(self):
         if self.pending_retransmission is not None:
+            print("resend", self.pending_retransmission.message_counter)
             self.session.send(self.pending_retransmission)
             return
         self.send(
@@ -99,6 +112,7 @@ class Exchange:
         if message.exchange_flags & ExchangeFlags.A:
             if message.acknowledged_message_counter is None:
                 # Drop messages that are missing an acknowledgement counter.
+                print("missing message ack counter")
                 return True
             if (
                 self.pending_retransmission is not None
@@ -106,12 +120,24 @@ class Exchange:
                 != self.pending_retransmission.message_counter
             ):
                 # Drop messages that have the wrong acknowledgement counter.
+                print("wrong ack counter")
+                print("awaiting", self.pending_retransmission.message_counter)
+                print(message)
                 return True
             self.pending_retransmission = None
             self.next_retransmission_time = None
+            if self._closing and not self.pending_payloads:
+                print(f"\033[93mexchange closed {self.exchange_id}\033[0m")
+                if self.initiator:
+                    self.session.initiator_exchanges.pop(self.exchange_id)
+                else:
+                    self.session.responder_exchanges.pop(self.exchange_id)
 
         if message.protocol_id not in self.protocols:
             # Drop messages that don't match the protocols we're waiting for.
+            # This is likely a standalone ACK to an interaction model response.
+            print("protocol mismatch", message.protocol_id, self.protocols)
+            print(message)
             return True
 
         # Section 4.12.5.2.2
@@ -120,6 +146,7 @@ class Exchange:
             if message.duplicate:
                 # Send a standalone acknowledgement.
                 self.send_standalone()
+                print("standalone")
                 return True
             if self.pending_acknowledgement is not None:
                 # Send a standalone acknowledgement with the message counter we're about to overwrite.
@@ -132,3 +159,23 @@ class Exchange:
         if message.duplicate:
             return True
         return False
+
+    def close(self):
+        self._closing = True
+
+        if self.pending_retransmission is not None:
+            self.send_standalone()
+            return
+
+        if self.initiator:
+            self.session.initiator_exchanges.pop(self.exchange_id)
+        else:
+            self.session.responder_exchanges.pop(self.exchange_id)
+        print(f"\033[93mexchange closed {self.exchange_id}\033[0m")
+
+    def resend_pending(self):
+        if self.pending_retransmission is None:
+            return
+        if time.monotonic() < self.next_retransmission_time:
+            return
+        # self.send_standalone()
